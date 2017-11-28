@@ -1,16 +1,22 @@
-package io.swagger.v3.parser;
+package io.swagger.parser;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
-import io.swagger.v3.oas.models.OpenAPI;
-import io.swagger.v3.oas.models.media.Schema;
-import io.swagger.v3.parser.core.models.AuthorizationValue;
-import io.swagger.v3.parser.models.RefFormat;
-import io.swagger.v3.parser.models.RefType;
-import io.swagger.v3.parser.util.DeserializationUtils;
-import io.swagger.v3.parser.util.PathUtils;
-import io.swagger.v3.parser.util.RefUtils;
-import io.swagger.v3.parser.util.OpenAPIDeserializer;
+import io.swagger.models.Model;
+import io.swagger.models.ModelImpl;
+import io.swagger.models.RefModel;
+import io.swagger.models.Response;
+import io.swagger.models.Swagger;
+import io.swagger.models.auth.AuthorizationValue;
+import io.swagger.models.properties.Property;
+import io.swagger.models.properties.RefProperty;
+import io.swagger.models.refs.RefFormat;
+import io.swagger.models.refs.RefType;
+import io.swagger.parser.util.DeserializationUtils;
+import io.swagger.parser.util.PathUtils;
+import io.swagger.parser.util.RefUtils;
+import io.swagger.parser.util.SwaggerDeserializer;
+import org.apache.commons.lang3.StringUtils;
 
 import java.io.File;
 import java.nio.file.Path;
@@ -33,19 +39,11 @@ import java.util.regex.Pattern;
  */
 public class ResolverCache {
 
+    private static final Pattern PARAMETER_PATTERN = Pattern.compile("^" + RefType.PARAMETER.getInternalPrefix() + "(?<name>.+)");
+    private static final Pattern DEFINITION_PATTERN = Pattern.compile("^" + RefType.DEFINITION.getInternalPrefix() + "(?<name>.+)");
+    private static final Pattern RESPONSE_PATTERN = Pattern.compile("^" + RefType.RESPONSE.getInternalPrefix() + "(?<name>.+)");
 
-    private static final Pattern SCHEMAS_PATTERN = Pattern.compile("^" + RefType.COMPONENTS.getInternalPrefix() + "schemas/(?<name>.+)");
-    private static final Pattern RESPONSES_PATTERN = Pattern.compile("^" + RefType.COMPONENTS.getInternalPrefix() + "responses/(?<name>.+)");
-    private static final Pattern PARAMETERS_PATTERN = Pattern.compile("^" + RefType.COMPONENTS.getInternalPrefix() + "parameters/(?<name>.+)");
-    private static final Pattern REQUEST_BODIES_PATTERN = Pattern.compile("^" + RefType.COMPONENTS.getInternalPrefix() + "requestBodies/(?<name>.+)");
-    private static final Pattern EXAMPLES_PATTERN = Pattern.compile("^" + RefType.COMPONENTS.getInternalPrefix() + "examples/(?<name>.+)");
-    private static final Pattern LINKS_PATTERN = Pattern.compile("^" + RefType.COMPONENTS.getInternalPrefix() + "links/(?<name>.+)");
-    private static final Pattern CALLBACKS_PATTERN = Pattern.compile("^" + RefType.COMPONENTS.getInternalPrefix() + "callbacks/(?<name>.+)");
-    private static final Pattern HEADERS_PATTERN = Pattern.compile("^" + RefType.COMPONENTS.getInternalPrefix() + "headers/(?<name>.+)");
-    private static final Pattern SECURITY_SCHEMES = Pattern.compile("^" + RefType.COMPONENTS.getInternalPrefix() + "securitySchemes/(?<name>.+)");
-    private static final Pattern PATHS_PATTERN = Pattern.compile("^" + RefType.PATH.getInternalPrefix() +  "(?<name>.+)");
-
-    private final OpenAPI openApi;
+    private final Swagger swagger;
     private final List<AuthorizationValue> auths;
     private final Path parentDirectory;
     private final String rootPath;
@@ -58,8 +56,8 @@ public class ResolverCache {
      */
     private Map<String, String> renameCache = new HashMap<>();
 
-    public ResolverCache(OpenAPI openApi, List<AuthorizationValue> auths, String parentFileLocation) {
-        this.openApi = openApi;
+    public ResolverCache(Swagger swagger, List<AuthorizationValue> auths, String parentFileLocation) {
+        this.swagger = swagger;
         this.auths = auths;
         this.rootPath = parentFileLocation;
 
@@ -138,56 +136,78 @@ public class ResolverCache {
         }
 
         T result;
-        if (expectedType.equals(Schema.class)) {
-            OpenAPIDeserializer deserializer = new OpenAPIDeserializer();
-            result = (T) deserializer.getSchema((ObjectNode) tree, definitionPath.replace("/", "."), null);
+        if (expectedType.equals(Model.class)) {
+            SwaggerDeserializer ser = new SwaggerDeserializer();
+            result = (T) ser.definition((ObjectNode) tree, definitionPath.replace("/", "."), null);
         } else {
             result = DeserializationUtils.deserialize(tree, file, expectedType);
         }
+
+        updateLocalRefs(file, result);
+
         resolutionCache.put(ref, result);
 
         return result;
     }
 
+    protected <T> void updateLocalRefs(String file, T result) {
+        if(result instanceof Response) {
+            Response response = (Response) result;
+            updateLocalRefs(file, response.getSchema());
+        }
+        else if(result instanceof RefProperty) {
+            RefProperty prop = (RefProperty) result;
+            updateLocalRefs(file, prop);
+        }
+        else if(result instanceof Model) {
+            Model model = (Model) result;
+            updateLocalRefs(file, model);
+        }
+    }
 
+    protected <T> void updateLocalRefs(String file, Model schema) {
+        if(schema instanceof RefModel) {
+            RefModel ref = (RefModel) schema;
+            String updatedLocation = merge(file, ref.get$ref());
+            ref.set$ref(updatedLocation);
+        }
+        else if(schema instanceof ModelImpl) {
+            ModelImpl impl = (ModelImpl) schema;
+            if(impl.getProperties() != null) {
+                for(Property property : schema.getProperties().values()) {
+                    updateLocalRefs(file, property);
+                }
+            }
+        }
+    }
 
-    private Object loadInternalRef(String ref) {
-        Object result = null;
+    protected <T> void updateLocalRefs(String file, Property schema) {
+        if(schema instanceof RefProperty) {
+            RefProperty ref = (RefProperty) schema;
+            String updatedLocation = merge(file, ref.get$ref());
+            ref.set$ref(updatedLocation);
+        }
+    }
 
-        if(ref.startsWith("#/components/schemas")) {
-            result = getFromMap(ref, openApi.getComponents().getSchemas(), SCHEMAS_PATTERN);
+    protected String merge(String host, String ref) {
+        if(StringUtils.isBlank(host)) {
+            return ref;
         }
-        else if(ref.startsWith("#/components/requestBodies")) {
-            result = getFromMap(ref, openApi.getComponents().getRequestBodies(), REQUEST_BODIES_PATTERN);
+        if(ref.startsWith("http:") || ref.startsWith("https:")) {
+            // already an absolute ref
+            return ref;
         }
-        else if(ref.startsWith("#/components/examples")) {
-            result = getFromMap(ref, openApi.getComponents().getExamples(), EXAMPLES_PATTERN);
+        if(!host.startsWith("http:") && !host.startsWith("https:")) {
+            return ref;
         }
-        else if(ref.startsWith("#/components/responses")) {
-            result = getFromMap(ref, openApi.getComponents().getResponses(), RESPONSES_PATTERN);
+        if(ref.startsWith(".")) {
+            // relative ref, leave alone
+            return ref;
         }
-        else if(ref.startsWith("#/components/parameters")) {
-            result = getFromMap(ref, openApi.getComponents().getParameters(), PARAMETERS_PATTERN);
+        if(host.endsWith("/") && ref.startsWith("/")) {
+            return host + ref.substring(1);
         }
-        else if(ref.startsWith("#/components/links")) {
-            result = getFromMap(ref, openApi.getComponents().getLinks(), LINKS_PATTERN);
-        }
-        else if(ref.startsWith("#/components/headers")) {
-            result = getFromMap(ref, openApi.getComponents().getHeaders(), HEADERS_PATTERN);
-        }
-        else if(ref.startsWith("#/components/callbacks")) {
-            result = getFromMap(ref, openApi.getComponents().getCallbacks(), CALLBACKS_PATTERN);
-        }
-        else if(ref.startsWith("#/components/securitySchemes")) {
-            result = getFromMap(ref, openApi.getComponents().getSecuritySchemes(), SECURITY_SCHEMES);
-        }
-        else if(ref.startsWith("#/paths")) {
-            result = getFromMap(ref, openApi.getPaths(), PATHS_PATTERN);
-        }
-
-
-        return result;
-
+        return host + ref;
     }
 
     private String unescapePointer(String jsonPathElement) {
@@ -197,6 +217,26 @@ public class ResolverCache {
         jsonPathElement = jsonPathElement.replaceAll("~1", "/");
         // Then transforming any occurrence of the sequence '~0' to '~'.
         return jsonPathElement.replaceAll("~0", "~");
+    }
+
+    private Object loadInternalRef(String ref) {
+        Object result = null;
+
+        if(ref.startsWith("#/definitions")) {
+            result = getFromMap(ref, swagger.getParameters(), PARAMETER_PATTERN);
+        }
+        else if(ref.startsWith("#/responses")) {
+            result = getFromMap(ref, swagger.getResponses(), RESPONSE_PATTERN);
+        }
+        else if(ref.startsWith("#/parameters")) {
+            result = getFromMap(ref, swagger.getParameters(), PARAMETER_PATTERN);
+        }
+        if (result == null) {
+            result = getFromMap(ref, swagger.getDefinitions(), DEFINITION_PATTERN);
+        }
+
+        return result;
+
     }
 
     private Object getFromMap(String ref, Map map, Pattern pattern) {
